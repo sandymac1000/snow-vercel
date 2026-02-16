@@ -85,19 +85,11 @@ const RESORTS = [
 ];
 
 /* ─── MERGE API DATA ─── */
-function mergeApiData(apiData, fallback) {
-  const out = JSON.parse(JSON.stringify(fallback));
-  const fetchTime = new Date(apiData.fetchedAt || Date.now());
-  out.lastUpdated = fetchTime.toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long", year: "numeric" })
-    + " — " + fetchTime.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }) + " CET (live)";
-  out.isLive = true;
-  out.areaCount = apiData.areaCount || 0;
-
+function mergeMainData(apiData, base) {
+  const out = base;
   if (apiData.dailyReport && apiData.dailyReport !== "No daily report found") {
     out.dailyReport = apiData.dailyReport;
   }
-
-  // Group areas by resort
   const grouped = {};
   for (const a of (apiData.areas || [])) {
     const rid = a.resort;
@@ -114,7 +106,6 @@ function mergeApiData(apiData, fallback) {
       note: isClosed ? (a.closureReason || "Closed today") : "",
     });
   }
-
   for (const [rid, areas] of Object.entries(grouped)) {
     if (!out.resorts[rid]) continue;
     out.resorts[rid].areas = areas;
@@ -123,13 +114,70 @@ function mergeApiData(apiData, fallback) {
     const ls = apiData.areas.find(a => a.resort === rid && a.lastSnowfall);
     if (ls) out.resorts[rid].lastSnowfall = ls.lastSnowfall;
   }
-
-  // Closure notices
-  if (apiData.closureNotices && apiData.closureNotices.length > 0) {
-    out.closureNotices = apiData.closureNotices;
-  }
-
+  if (apiData.closureNotices?.length > 0) out.closureNotices = apiData.closureNotices;
   return out;
+}
+
+function mergeContaminesData(apiData, base) {
+  const out = base;
+  const a = (apiData.areas || [])[0];
+  if (!a) return out;
+  const isClosed = a.isClosed || a.liftsOpen === 0;
+  const snowDisplay = a.snowBase ? `${a.snow} (top) / ${a.snowBase} (base)` : a.snow;
+  const freshDisplay = a.freshDetail || a.fresh;
+  out.resorts["les-contamines"] = {
+    areas: [{
+      name: a.name, alt: a.alt, snow: snowDisplay || "—",
+      quality: a.quality || "—", fresh: freshDisplay || "0cm",
+      temp: `${a.tempMorning || "?"} / ${a.tempAfternoon || "?"}`,
+      lifts: (a.liftsOpen != null && a.liftsTotal != null) ? `${a.liftsOpen}/${a.liftsTotal}` : (isClosed ? "CLOSED" : ""),
+      slopes: (a.slopesOpen != null && a.slopesTotal != null) ? `${a.slopesOpen}/${a.slopesTotal}` : "",
+      wind: a.wind || "",
+      note: a.messageOfDay || (isClosed ? "Closed today" : ""),
+    }],
+    avalanche: a.avalanche || null,
+    lastSnowfall: null,
+    stationDetail: a.stationMeasurements || [],
+  };
+  // Add weather report to daily report if we have it
+  if (a.weatherReport && !out.contaminesWeather) {
+    out.contaminesWeather = a.weatherReport;
+  }
+  return out;
+}
+
+function mergeComblouxData(apiData, base) {
+  const out = base;
+  const a = (apiData.areas || [])[0];
+  if (!a) return out;
+  const isClosed = a.isClosed;
+  const snowDisplay = a.snowBase ? `${a.snow} (top) / ${a.snowBase} (base)` : a.snow;
+  out.resorts["combloux"] = {
+    areas: [{
+      name: a.name, alt: a.alt, snow: snowDisplay || "—",
+      quality: a.quality || "—", fresh: a.fresh || "0cm",
+      temp: "— / —",
+      lifts: (a.liftsOpen != null && a.liftsTotal != null) ? `${a.liftsOpen}/${a.liftsTotal}` : (isClosed ? "CLOSED" : "Open"),
+      slopes: (a.slopesOpen != null && a.slopesTotal != null) ? `${a.slopesOpen}/${a.slopesTotal}` : "",
+      wind: "",
+      note: a.slopeBreakdown ? `🟢${a.slopeBreakdown.green || "?"} 🔵${a.slopeBreakdown.blue || "?"} 🔴${a.slopeBreakdown.red || "?"} ⚫${a.slopeBreakdown.black || "?"}` : "",
+    }],
+    avalanche: null,
+    lastSnowfall: a.lastUpdate || null,
+  };
+  return out;
+}
+
+async function fetchEndpoint(path) {
+  try {
+    const resp = await fetch(path);
+    if (!resp.ok) return { ok: false, error: `HTTP ${resp.status}` };
+    const data = await resp.json();
+    if (data.error) return { ok: false, error: data.error };
+    return { ok: true, data };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
 }
 
 /* ─── UI ─── */
@@ -244,18 +292,45 @@ export default function App() {
   const refresh = useCallback(async () => {
     setBusy(true); setStatus("loading"); setErr("");
     try {
-      const resp = await fetch("/api/snow");
-      if (!resp.ok) {
-        const body = await resp.json().catch(() => ({}));
-        throw new Error(body.error || `HTTP ${resp.status}`);
-      }
-      const apiData = await resp.json();
-      if (apiData.error) throw new Error(apiData.error);
-      if (!apiData.areas || apiData.areas.length === 0) throw new Error("No areas parsed from MBNR");
+      // Fetch all 3 endpoints in parallel
+      const [main, contam, comblx] = await Promise.all([
+        fetchEndpoint("/api/snow"),
+        fetchEndpoint("/api/snow-contamines"),
+        fetchEndpoint("/api/snow-combloux"),
+      ]);
 
-      const merged = mergeApiData(apiData, FALLBACK);
-      setData(merged);
-      setStatus("live");
+      let out = JSON.parse(JSON.stringify(FALLBACK));
+      const now = new Date();
+      let liveCount = 0;
+      const failedSources = [];
+
+      if (main.ok) {
+        out = mergeMainData(main.data, out);
+        liveCount += (main.data.areaCount || main.data.areas?.length || 0);
+      } else { failedSources.push("MBNR"); }
+
+      if (contam.ok) {
+        out = mergeContaminesData(contam.data, out);
+        liveCount++;
+      } else { failedSources.push("Contamines"); }
+
+      if (comblx.ok) {
+        out = mergeComblouxData(comblx.data, out);
+        liveCount++;
+      } else { failedSources.push("Combloux"); }
+
+      if (liveCount > 0) {
+        out.lastUpdated = now.toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long", year: "numeric" })
+          + " — " + now.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }) + " CET (live)";
+        out.isLive = true;
+        out.areaCount = liveCount;
+        out.failedSources = failedSources;
+        setData(out);
+        setStatus(failedSources.length > 0 ? "partial" : "live");
+        if (failedSources.length > 0) setErr(failedSources.join(", ") + " failed");
+      } else {
+        throw new Error("All sources failed");
+      }
     } catch (e) {
       setErr(e.message);
       setStatus("failed");
@@ -266,9 +341,9 @@ export default function App() {
 
   useEffect(() => { refresh(); }, [refresh]);
 
-  const stColor = status === "live" ? "#4ade80" : status === "failed" ? "#fbbf24" : "#4a9eff";
-  const stBg = status === "live" ? "rgba(34,197,94,0.08)" : status === "failed" ? "rgba(245,158,11,0.08)" : "rgba(74,158,255,0.08)";
-  const stBorder = status === "live" ? "rgba(34,197,94,0.18)" : status === "failed" ? "rgba(245,158,11,0.18)" : "rgba(74,158,255,0.18)";
+  const stColor = status === "live" ? "#4ade80" : status === "partial" ? "#38bdf8" : status === "failed" ? "#fbbf24" : "#4a9eff";
+  const stBg = status === "live" ? "rgba(34,197,94,0.08)" : status === "partial" ? "rgba(56,189,248,0.08)" : status === "failed" ? "rgba(245,158,11,0.08)" : "rgba(74,158,255,0.08)";
+  const stBorder = status === "live" ? "rgba(34,197,94,0.18)" : status === "partial" ? "rgba(56,189,248,0.18)" : status === "failed" ? "rgba(245,158,11,0.18)" : "rgba(74,158,255,0.18)";
 
   return (
     <div style={{ minHeight: "100vh", background: "linear-gradient(175deg, #040a18 0%, #0c1628 25%, #121f38 60%, #182848 100%)", color: "#d4e3f5", fontFamily: "var(--f)" }}>
@@ -297,8 +372,9 @@ export default function App() {
         <div style={{ background: stBg, border: `1px solid ${stBorder}`, borderRadius: 10, padding: "8px 14px", marginBottom: 12, display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
           <span style={{ fontSize: 11, color: stColor, fontFamily: "var(--f)", fontWeight: 600, flex: 1 }}>
             {status === "loading" && <span style={{ display: "inline-block", animation: "spin 1s linear infinite", marginRight: 4 }}>⟳</span>}
-            {status === "loading" ? "🔄 Fetching live data from MBNR…"
-              : status === "live" ? `✅ Live — ${data.areaCount || "?"} areas from montblancnaturalresort.com · Les Contamines & Combloux: snapshot`
+            {status === "loading" ? "🔄 Fetching live data from 3 sources…"
+              : status === "live" ? `✅ All live — MBNR + Les Contamines + Combloux`
+              : status === "partial" ? `🔵 Partial live — ${err || "some sources"} using snapshot`
               : `⚠️ ${err} — showing Feb 16 snapshot`}
           </span>
           {status !== "loading" && (
