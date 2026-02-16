@@ -1,0 +1,13 @@
+{
+  "framework": "vite",
+  "buildCommand": "vite build",
+  "outputDirectory": "dist",
+  "rewrites": [
+    { "source": "/api/snow", "destination": "/api/snow" }
+  ],
+  "functions": {
+    "api/snow.js": {
+      "maxDuration": 20
+    }
+  }
+}
